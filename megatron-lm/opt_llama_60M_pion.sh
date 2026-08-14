@@ -6,19 +6,20 @@ export TORCH_CPP_LOG_LEVEL=ERROR
 export NCCL_ML_DISABLE=1
 export NCCL_NVLS_ENABLE=1
 export WANDB_MODE=offline
+export CUDNN_FRONTEND_CUDART_LIB_NAME=libcudart.so.13
 
 PORT=$((29500 + $$ % 100))
-
-
-mkdir -p /usr/local/cuda/compat/lib 2>/dev/null || true
-ln -sf /.singularity.d/libs/libcuda.so.1 /usr/local/cuda/compat/lib/libcuda.so.1 2>/dev/null || true
-ln -sf /.singularity.d/libs/libcuda.so /usr/local/cuda/compat/lib/libcuda.so 2>/dev/null || true
-export LD_LIBRARY_PATH=/workspace/cuda_fix/compat/lib:$LD_LIBRARY_PATH
+PION_ENV_PATH=/root/.venvs/pion
+export CUDA_HOME=/usr/local/cuda
+export CUDA_PATH=/usr/local/cuda
+export CUDNN_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cudnn
+export PATH=/usr/local/cuda/bin:${PION_ENV_PATH}/bin:${PATH}
+unset LD_LIBRARY_PATH
 export TOKENIZERS_PARALLELISM=true
 
 # Total tokens, global batch size, and training iterations
 # Strategy for parallelization
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 # 1: 1.2; 2: 2.4; 4: 4.8; 8: 9.6;
 TOKEN=9.6
 # bash arithmetic only supports integer
@@ -33,9 +34,13 @@ GLOBAL_BATCH=512
 TRAIN_ITER=$((TOTAL_TOKENS / GLOBAL_BATCH / 256))
 
 NNODES=1
-NUM_GPUS=2
-ACCUMULATION_STEPS=1
-MICRO_BATCH_SIZE=$((GLOBAL_BATCH / NUM_GPUS / ACCUMULATION_STEPS))
+NUM_GPUS=1
+MICRO_BATCH_SIZE=8
+if (( GLOBAL_BATCH % (NUM_GPUS * MICRO_BATCH_SIZE) != 0 )); then
+    echo "GLOBAL_BATCH=${GLOBAL_BATCH} must be divisible by NUM_GPUS=${NUM_GPUS} * MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE}."
+    exit 1
+fi
+ACCUMULATION_STEPS=$((GLOBAL_BATCH / NUM_GPUS / MICRO_BATCH_SIZE))
 WORLD_SIZE=$((NUM_GPUS * $NNODES))
 
 
@@ -69,12 +74,8 @@ case "${USE_SECOND_MOMENTUM:-}" in
 esac
 # Pretrain Script
 PRETRAIN_SCRIPT="pretrain_gpt.py"
-# Experiment Name and Saving Path
-JOB_NAME=llama-60m-pion-9.6B-lr-${LR}-final-lr-${MIN_LR}-cosine-decay-momentum-${PION_MOMENTUM}
-REPO_PATH="/data/people/kshi/results/${JOB_NAME}"
-TENSORBOARD_PATH="${REPO_PATH}/tensorboard/${JOB_NAME}"
-CHECKPOINT_PATH="${REPO_PATH}/checkpoints/${JOB_NAME}"
-WANDB_PATH="${REPO_PATH}/wandb/${JOB_NAME}"
+BASE_JOB_NAME=llama-60m-pion-pair-swiglu-9.6B-lr-${LR}-final-lr-${MIN_LR}-cosine-decay-momentum-${PION_MOMENTUM}
+SEEDS=(1234 2345 3456)
 
 
 TRAINING_ARGS=(
@@ -101,18 +102,10 @@ TRAINING_ARGS=(
     --no-gradient-accumulation-fusion
 )
 
-LOG_DIR="${REPO_PATH}/logs"
-mkdir -p $LOG_DIR
-LOG_FILE="${LOG_DIR}/${JOB_NAME}.log"
-mkdir -p $TENSORBOARD_PATH
-mkdir -p $CHECKPOINT_PATH
-mkdir -p $WANDB_PATH
-
-TRAIN_DATA_NAME="c4-megatron/train"
-TRAIN_BASE_PATH="${TRAIN_BASE_PATH:-/data/shared/pion_usage/${TRAIN_DATA_NAME}}"
-
-VALID_DATA_NAME="c4-megatron/val" 
-VALID_BASE_PATH="${VALID_BASE_PATH:-/data/shared/pion_usage/${VALID_DATA_NAME}}"
+C4_DATA_ROOT=/data/datasets/c4
+TRAIN_BASE_PATH="${TRAIN_BASE_PATH:-${C4_DATA_ROOT}/megatron/train}"
+VALID_BASE_PATH="${VALID_BASE_PATH:-${C4_DATA_ROOT}/megatron/val}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-${C4_DATA_ROOT}/tokenizer}"
 
 DATA_PATH=""
 while IFS= read -r file; do
@@ -127,17 +120,17 @@ while IFS= read -r file; do
 done < <(find "$VALID_BASE_PATH" -type f -path "**.bin" 2>/dev/null)
 
 # The path to cache the data
-DATA_PATH_CACHE="/data/shared/pion_usage/${TRAIN_DATA_NAME}_cache"
+DATA_PATH_CACHE="${DATA_PATH_CACHE:-${C4_DATA_ROOT}/megatron/cache}"
 
 DATA_ARGS=(
-    --tokenizer-model /data/shared/pion_usage/tokenizer_t5
+    --tokenizer-model "${TOKENIZER_MODEL}"
     --tokenizer-type HuggingFaceTokenizer
     --tokenizer-hf-use-fast
     --seq-length 256
     --train-data-path $DATA_PATH
     --valid-data-path $VALID_DATA_PATH
     --full-validation
-    --data-cache-path ${DATA_PATH_CACHE}
+    --data-cache-path "${DATA_PATH_CACHE}"
     --train-iters $TRAIN_ITER 
     --num-dataset-builder-threads 8
     --num-workers 4
@@ -148,6 +141,12 @@ DATA_ARGS=(
 
 MODEL_ARGS=(
     --normalization RMSNorm
+    --pair-init
+    --pair-init-input-second-moment 1.0
+    --pair-diagnostics
+    --pair-diagnostics-interval 1000
+    --pair-diagnostics-steps 1 10 100
+    --pair-diagnostics-calibration-size 16
     --use-same-init-for-output-layers
     --num-layers 8
     --hidden-size 512
@@ -171,71 +170,73 @@ MODEL_ARGS=(
     --no-persist-layer-norm
     --use-cpu-initialization
 )
-CKPT_ARGS=(
-    --load ${CHECKPOINT_PATH}
-    --ckpt-format "torch"
-    --save-interval 10000
-    --save $CHECKPOINT_PATH
-    --save-initial-checkpoint
-)
 
-LOGGER_ARGS=(
-    --log-params-norm
-    --log-throughput
-    --log-interval 100
-    --log-params-norm
-    --log-num-zeros-in-grad
-    --log-validation-ppl-to-tensorboard
-    --log-timers-to-tensorboard
-    --log-memory-to-tensorboard
-    --log-world-size-to-tensorboard
-    --tensorboard-dir ${TENSORBOARD_PATH}
-)
+for SEED in "${SEEDS[@]}"; do
+    JOB_NAME="${BASE_JOB_NAME}-seed-${SEED}"
+    REPO_PATH="/data/outputs/pion-pair-60m/${JOB_NAME}"
+    TENSORBOARD_PATH="${REPO_PATH}/tensorboard/${JOB_NAME}"
+    CHECKPOINT_PATH="/data/checkpoints/pion-pair-60m/${JOB_NAME}"
+    WANDB_PATH="${REPO_PATH}/wandb/${JOB_NAME}"
+    LOG_DIR="${REPO_PATH}/logs"
+    LOG_FILE="${LOG_DIR}/${JOB_NAME}.log"
 
-WANDB_ARGS=(
-    --wandb-project test
-    --wandb-exp-name $JOB_NAME
-    --wandb-save-dir ${WANDB_PATH}
-)
+    mkdir -p "$LOG_DIR"
+    mkdir -p "$TENSORBOARD_PATH"
+    mkdir -p "$CHECKPOINT_PATH"
+    mkdir -p "$WANDB_PATH"
 
-# Auto-restart settings for transient crash (e.g. Bus error).
-MAX_RESTARTS=${MAX_RESTARTS:-20}
-RESTART_SLEEP_SECONDS=${RESTART_SLEEP_SECONDS:-30}
-attempt=0
+    SEED_ARGS=(
+        --seed ${SEED}
+    )
 
-while true; do
-    attempt=$((attempt + 1))
-    echo "[$(date '+%F %T')] launch attempt ${attempt}/${MAX_RESTARTS}" | tee -a "$LOG_FILE"
+    CKPT_ARGS=(
+        --load ${CHECKPOINT_PATH}
+        --ckpt-format "torch"
+        --save-interval 10000
+        --save ${CHECKPOINT_PATH}
+        --save-initial-checkpoint
+    )
+
+    LOGGER_ARGS=(
+        --log-params-norm
+        --log-throughput
+        --log-interval 100
+        --tensorboard-log-interval 1
+        --log-num-zeros-in-grad
+        --log-validation-ppl-to-tensorboard
+        --log-timers-to-tensorboard
+        --log-memory-to-tensorboard
+        --log-world-size-to-tensorboard
+        --tensorboard-dir ${TENSORBOARD_PATH}
+    )
+
+    WANDB_ARGS=(
+        --wandb-project test
+        --wandb-exp-name ${JOB_NAME}
+        --wandb-save-dir ${WANDB_PATH}
+    )
+
+    echo "[$(date '+%F %T')] starting seed=${SEED}, micro_batch_size=${MICRO_BATCH_SIZE}, accumulation_steps=${ACCUMULATION_STEPS}" | tee -a "$LOG_FILE"
 
     {
-        PYTHONWARNINGS=ignore torchrun --master_port $PORT \
+        PYTHONWARNINGS=ignore ${PION_ENV_PATH}/bin/python -m torch.distributed.run --master_port $PORT \
             ${DISTRIBUTED_ARGS[@]} \
             $PRETRAIN_SCRIPT \
             ${DATA_ARGS[@]} \
             ${MODEL_ARGS[@]} \
             ${TRAINING_ARGS[@]} \
             ${PARALLEL_ARGS[@]} \
+            ${SEED_ARGS[@]} \
             ${CKPT_ARGS[@]} \
             ${LOGGER_ARGS[@]} \
             ${WANDB_ARGS[@]}
     } 2>&1 | grep --line-buffered -v -E "(Warning|DeprecationWarning|UserWarning|FutureWarning|WARNING|Deprecated)" | tee -a "$LOG_FILE"
 
     run_status=${PIPESTATUS[0]}
-    if [[ ${run_status} -eq 0 ]]; then
-        echo "[$(date '+%F %T')] training finished successfully." | tee -a "$LOG_FILE"
-        break
-    fi
-
-    if [[ ${attempt} -ge ${MAX_RESTARTS} ]]; then
-        echo "[$(date '+%F %T')] reached MAX_RESTARTS=${MAX_RESTARTS}, exit code=${run_status}." | tee -a "$LOG_FILE"
+    if [[ ${run_status} -ne 0 ]]; then
+        echo "[$(date '+%F %T')] seed=${SEED} failed with exit code=${run_status}." | tee -a "$LOG_FILE"
         exit ${run_status}
     fi
 
-    if tail -n 300 "$LOG_FILE" | grep -qi "Fatal Python error: Bus error\|Bus error"; then
-        echo "[$(date '+%F %T')] detected Bus error, sleep ${RESTART_SLEEP_SECONDS}s then restart." | tee -a "$LOG_FILE"
-        sleep "${RESTART_SLEEP_SECONDS}"
-    else
-        echo "[$(date '+%F %T')] non-Bus-error failure (exit=${run_status}), stop auto-restart." | tee -a "$LOG_FILE"
-        exit ${run_status}
-    fi
+    echo "[$(date '+%F %T')] seed=${SEED} finished successfully." | tee -a "$LOG_FILE"
 done

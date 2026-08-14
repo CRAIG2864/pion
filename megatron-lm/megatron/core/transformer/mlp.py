@@ -139,6 +139,48 @@ def _antipodal_parseval_frame(
     return frame.index_select(0, row_permutation)
 
 
+def _parseval_frame(
+    row_count: int, column_count: int, generator: torch.Generator
+) -> torch.Tensor:
+    """Construct a randomized Parseval frame with orthonormal columns."""
+    factors = _randomized_dct_factors(row_count, generator)
+    selected_columns = torch.randperm(row_count, generator=generator)[:column_count]
+    selected_basis = torch.zeros(column_count, row_count, dtype=torch.float64)
+    selected_basis[torch.arange(column_count), selected_columns] = 1.0
+    return _apply_randomized_dct(selected_basis, factors).transpose(0, 1)
+
+
+def _swiglu_pair_frames(
+    inner_width: int, hidden_size: int, generator: torch.Generator
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Construct the aligned antipodal gate frame and same-sign up frame."""
+    if inner_width >= 2 * hidden_size:
+        half_inner_width = inner_width // 2
+        gate_half = _parseval_frame(half_inner_width, hidden_size, generator)
+        up_half = _parseval_frame(half_inner_width, hidden_size, generator)
+        gate_frame = torch.cat((gate_half, -gate_half), dim=0) / math.sqrt(2.0)
+        up_frame = torch.cat((up_half, up_half), dim=0) / math.sqrt(2.0)
+        paired_dimension = hidden_size
+        defect_dimension = 0
+    else:
+        paired_dimension = inner_width - hidden_size
+        defect_dimension = 2 * hidden_size - inner_width
+        factors = _randomized_dct_factors(hidden_size, generator)
+        orthogonal = _apply_randomized_dct(
+            torch.eye(hidden_size, dtype=torch.float64), factors
+        ).transpose(0, 1)
+        paired = orthogonal[:paired_dimension]
+        unpaired = orthogonal[paired_dimension:]
+        gate_frame = torch.cat(
+            (paired / math.sqrt(2.0), -paired / math.sqrt(2.0), unpaired), dim=0
+        )
+        up_frame = torch.cat(
+            (paired / math.sqrt(2.0), paired / math.sqrt(2.0), unpaired), dim=0
+        )
+
+    return gate_frame, up_frame, paired_dimension, defect_dimension
+
+
 def _right_multiply_reverse_pair_j0_transpose(vectors: torch.Tensor) -> torch.Tensor:
     half = vectors.shape[-1] // 2
     return torch.cat(
@@ -157,6 +199,204 @@ def _pair_activation_gamma(activation_func) -> float:
     raise ValueError(
         'PAIR initialization supports exact GELU, ReLU, and SiLU activations only.'
     )
+
+
+def _pair_activation_derivative(values: torch.Tensor, activation_func) -> torch.Tensor:
+    """Evaluate the derivative used by the one-time PAIR Jacobian diagnostic."""
+    if activation_func is F.gelu:
+        normal_cdf = 0.5 * (1.0 + torch.erf(values / math.sqrt(2.0)))
+        normal_pdf = torch.exp(-0.5 * values.square()) / math.sqrt(2.0 * math.pi)
+        return normal_cdf + values * normal_pdf
+    if activation_func is F.relu:
+        return (values > 0.0).to(dtype=values.dtype)
+    if activation_func is F.silu:
+        sigmoid = torch.sigmoid(values)
+        return sigmoid * (1.0 + values * (1.0 - sigmoid))
+    raise ValueError(
+        'PAIR diagnostics support exact GELU, ReLU, and SiLU activations only.'
+    )
+
+
+@torch.no_grad()
+def _pair_initialization_diagnostics(
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    activation_func,
+    input_second_moment: float,
+    seed: int,
+    calibration_size: int,
+) -> dict[str, float]:
+    """Compute the bounded, one-time structural diagnostics from the PAIR construction."""
+    if calibration_size < 1:
+        raise ValueError('PAIR diagnostic calibration size must be positive.')
+
+    ffn_hidden_size, hidden_size = up_weight.shape
+    half_ffn_size = ffn_hidden_size // 2
+    if tuple(down_weight.shape) != (hidden_size, ffn_hidden_size):
+        raise ValueError('PAIR diagnostics received incompatible fc1 and fc2 shapes.')
+
+    pair_scale_inverse = math.sqrt(2.0)
+    ga = up_weight[:half_ffn_size] * pair_scale_inverse
+    gb = down_weight[:, :half_ffn_size] * pair_scale_inverse
+
+    gamma = _pair_activation_gamma(activation_func)
+    beta = 0.25 * math.log(gamma)
+    positions = torch.linspace(-1.0, 1.0, hidden_size, dtype=torch.float64)
+    mean_squared_scale = 2.0 * half_ffn_size / (hidden_size * input_second_moment)
+    sigma_center = (
+        math.sqrt(mean_squared_scale) / torch.exp(2.0 * beta * positions).mean().sqrt()
+    )
+
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(seed) + 2)
+    inputs = torch.randn(
+        hidden_size, calibration_size, generator=generator, dtype=torch.float64
+    ) * math.sqrt(input_second_moment)
+    directions = torch.randn(
+        hidden_size, calibration_size, generator=generator, dtype=torch.float64
+    )
+
+    input_norm = torch.linalg.vector_norm(inputs).clamp_min(torch.finfo(torch.float64).tiny)
+    direction_norm = torch.linalg.vector_norm(directions).clamp_min(
+        torch.finfo(torch.float64).tiny
+    )
+
+    preactivations = up_weight @ inputs
+    zero_output = down_weight @ activation_func(preactivations)
+    zero_output_ratio = torch.linalg.vector_norm(zero_output) / input_norm
+
+    directional_branch_jacobian = down_weight @ (
+        _pair_activation_derivative(preactivations, activation_func)
+        * (up_weight @ directions)
+    )
+    residual_jacobian_directional_error = (
+        torch.linalg.vector_norm(directional_branch_jacobian) / direction_norm
+    )
+
+    canonical_map = 0.5 * (gb @ ga)
+    theta_preactivations = torch.cat(
+        (ga @ inputs, torch.zeros(half_ffn_size, calibration_size, dtype=torch.float64)),
+        dim=0,
+    )
+    theta_output = down_weight @ activation_func(theta_preactivations)
+    theta_target = (canonical_map @ inputs) / math.sqrt(2.0)
+    theta_escape_error = torch.linalg.vector_norm(theta_output - theta_target) / input_norm
+
+    ga_gram = ga.transpose(0, 1) @ ga
+    gb_gram = gb @ gb.transpose(0, 1)
+    ga_eigenvalues = torch.linalg.eigvalsh(ga_gram).clamp_min(0.0)
+    gb_eigenvalues = torch.linalg.eigvalsh(gb_gram).clamp_min(0.0)
+    ga_rank_tolerance = (
+        max(ga.shape)
+        * torch.finfo(torch.float64).eps
+        * ga_eigenvalues.max()
+    )
+    gb_rank_tolerance = (
+        max(gb.shape)
+        * torch.finfo(torch.float64).eps
+        * gb_eigenvalues.max()
+    )
+    reverse_spectral_target = (4.0 / float(sigma_center) ** 4) * ga_gram
+    reverse_spectral_error = torch.linalg.vector_norm(
+        gb_gram - reverse_spectral_target
+    ) / torch.linalg.vector_norm(gb_gram).clamp_min(torch.finfo(torch.float64).tiny)
+
+    identity = torch.eye(hidden_size, dtype=torch.float64)
+    canonical_skew_error = torch.linalg.vector_norm(
+        canonical_map + canonical_map.transpose(0, 1)
+    ) / torch.linalg.vector_norm(canonical_map).clamp_min(torch.finfo(torch.float64).tiny)
+    canonical_orthogonality_error = torch.linalg.vector_norm(
+        canonical_map.transpose(0, 1) @ canonical_map - identity
+    ) / math.sqrt(hidden_size)
+
+    return {
+        'up_rank': float((ga_eigenvalues > ga_rank_tolerance).sum()),
+        'down_rank': float((gb_eigenvalues > gb_rank_tolerance).sum()),
+        'up_sigma_min': float(torch.sqrt(ga_eigenvalues.min())),
+        'up_sigma_max': float(torch.sqrt(ga_eigenvalues.max())),
+        'down_sigma_min': float(torch.sqrt(gb_eigenvalues.min())),
+        'down_sigma_max': float(torch.sqrt(gb_eigenvalues.max())),
+        'reverse_spectral_error': float(reverse_spectral_error),
+        'zero_output_ratio': float(zero_output_ratio),
+        'residual_jacobian_directional_error': float(
+            residual_jacobian_directional_error
+        ),
+        'theta_pi_over_4_escape_error': float(theta_escape_error),
+        'canonical_map_skew_error': float(canonical_skew_error),
+        'canonical_map_orthogonality_error': float(canonical_orthogonality_error),
+        'calibration_input_second_moment': float(inputs.square().mean()),
+    }
+
+
+@torch.no_grad()
+def _pair_swiglu_initialization_diagnostics(
+    fused_fc1_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    input_second_moment: float,
+    seed: int,
+    calibration_size: int,
+    paired_dimension: int,
+    defect_dimension: int,
+) -> dict[str, float]:
+    """Compute one-time structural diagnostics for the three SwiGLU matrices."""
+    hidden_size = fused_fc1_weight.shape[1]
+    ffn_hidden_size = fused_fc1_weight.shape[0] // 2
+    inner_width = ffn_hidden_size // 2
+    gate_weight, up_weight = torch.chunk(fused_fc1_weight, 2, dim=0)
+
+    pair_scale_inverse = math.sqrt(2.0)
+    gate_base = gate_weight[:inner_width] * pair_scale_inverse
+    up_base = up_weight[:inner_width] * pair_scale_inverse
+    down_base = down_weight[:, :inner_width] * pair_scale_inverse
+
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(seed) + 3)
+    inputs = torch.randn(
+        hidden_size, calibration_size, generator=generator, dtype=torch.float64
+    ) * math.sqrt(input_second_moment)
+
+    gated_hidden = F.silu(gate_weight @ inputs) * (up_weight @ inputs)
+    zero_output = down_weight @ gated_hidden
+    zero_output_ratio = torch.linalg.vector_norm(zero_output) / torch.linalg.vector_norm(
+        inputs
+    )
+
+    gate_gram = gate_base.transpose(0, 1) @ gate_base
+    up_gram = up_base.transpose(0, 1) @ up_base
+    down_gram = down_base @ down_base.transpose(0, 1)
+    gate_up_metric_error = torch.linalg.vector_norm(
+        gate_gram - up_gram
+    ) / torch.linalg.vector_norm(gate_gram)
+    down_scale = torch.sum(down_gram * gate_gram) / torch.sum(gate_gram.square())
+    down_metric_error = torch.linalg.vector_norm(
+        down_gram - down_scale * gate_gram
+    ) / torch.linalg.vector_norm(down_gram)
+
+    gate_eigenvalues = torch.linalg.eigvalsh(gate_gram).clamp_min(0.0)
+    up_eigenvalues = torch.linalg.eigvalsh(up_gram).clamp_min(0.0)
+    down_eigenvalues = torch.linalg.eigvalsh(down_gram).clamp_min(0.0)
+    machine_epsilon = torch.finfo(torch.float64).eps
+    gate_rank_tolerance = max(gate_base.shape) * machine_epsilon * gate_eigenvalues.max()
+    up_rank_tolerance = max(up_base.shape) * machine_epsilon * up_eigenvalues.max()
+    down_rank_tolerance = max(down_base.shape) * machine_epsilon * down_eigenvalues.max()
+
+    return {
+        'gate_rank': float((gate_eigenvalues > gate_rank_tolerance).sum()),
+        'up_rank': float((up_eigenvalues > up_rank_tolerance).sum()),
+        'down_rank': float((down_eigenvalues > down_rank_tolerance).sum()),
+        'gate_sigma_min': float(torch.sqrt(gate_eigenvalues.min())),
+        'gate_sigma_max': float(torch.sqrt(gate_eigenvalues.max())),
+        'up_sigma_min': float(torch.sqrt(up_eigenvalues.min())),
+        'up_sigma_max': float(torch.sqrt(up_eigenvalues.max())),
+        'down_sigma_min': float(torch.sqrt(down_eigenvalues.min())),
+        'down_sigma_max': float(torch.sqrt(down_eigenvalues.max())),
+        'zero_output_ratio': float(zero_output_ratio),
+        'gate_up_metric_error': float(gate_up_metric_error),
+        'down_metric_error': float(down_metric_error),
+        'paired_dimension': float(paired_dimension),
+        'defect_dimension': float(defect_dimension),
+        'calibration_input_second_moment': float(inputs.square().mean()),
+    }
 
 
 def build_pair_mlp_weights(
@@ -206,6 +446,66 @@ def build_pair_mlp_weights(
     return up_weight.contiguous(), down_weight.contiguous()
 
 
+def build_pair_swiglu_mlp_weights(
+    hidden_size: int,
+    ffn_hidden_size: int,
+    input_second_moment: float,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Build fused gate/up and down PAIR weights for a bias-free SwiGLU MLP."""
+    d = hidden_size
+    h = ffn_hidden_size
+    m = h // 2
+
+    gamma = _pair_activation_gamma(F.silu)
+    beta = 0.25 * math.log(gamma)
+    positions = torch.linspace(-1.0, 1.0, d, dtype=torch.float64)
+    normalized_singular_values = torch.exp(beta * positions)
+    normalized_singular_values /= normalized_singular_values.square().mean().sqrt()
+    scale_squared = h / (d * input_second_moment)
+    scale = math.sqrt(scale_squared)
+
+    layer_seed = int(seed)
+    generator_v = torch.Generator(device='cpu')
+    generator_v.manual_seed(layer_seed)
+    generator_frames = torch.Generator(device='cpu')
+    generator_frames.manual_seed(layer_seed + 1)
+    generator_signs = torch.Generator(device='cpu')
+    generator_signs.manual_seed(layer_seed + 2)
+
+    v_factors = _randomized_dct_factors(d, generator_v)
+    gate_frame, up_frame, paired_dimension, defect_dimension = _swiglu_pair_frames(
+        m, d, generator_frames
+    )
+    up_signs = _rademacher_signs(d, generator_signs)
+
+    scaled_spectrum = scale * normalized_singular_values
+    gate_base = _apply_randomized_dct(gate_frame * scaled_spectrum, v_factors)
+    up_base = _apply_randomized_dct(
+        up_frame * scaled_spectrum * up_signs, v_factors
+    )
+    down_transpose_input = gate_frame / normalized_singular_values
+    down_transpose_input = _right_multiply_reverse_pair_j0_transpose(
+        down_transpose_input
+    )
+    down_base = (
+        (4.0 / scale_squared)
+        * _apply_randomized_dct(down_transpose_input, v_factors)
+    ).transpose(0, 1)
+
+    pair_scale = 1.0 / math.sqrt(2.0)
+    gate_weight = torch.cat((gate_base, gate_base), dim=0) * pair_scale
+    up_weight = torch.cat((up_base, up_base), dim=0) * pair_scale
+    fused_fc1_weight = torch.cat((gate_weight, up_weight), dim=0)
+    down_weight = torch.cat((down_base, -down_base), dim=1) * pair_scale
+    return (
+        fused_fc1_weight.contiguous(),
+        down_weight.contiguous(),
+        paired_dimension,
+        defect_dimension,
+    )
+
+
 # pylint: disable=missing-class-docstring
 @dataclass
 class MLPSubmodules:
@@ -248,6 +548,9 @@ class MLP(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        self._pair_diagnostics_collect = False
+        self._pair_diagnostics_accumulator = None
+        self._pair_initial_metrics: dict[str, float] = {}
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
@@ -316,42 +619,133 @@ class MLP(MegatronModule):
         self.layer_number = layer_number
         if not self.config.pair_init:
             return
-        if self.config.gated_linear_unit:
-            raise ValueError('PAIR initialization requires a non-gated dense MLP.')
 
-        up_weight = getattr(self.linear_fc1, 'weight', None)
+        fc1_weight = getattr(self.linear_fc1, 'weight', None)
         down_weight = getattr(self.linear_fc2, 'weight', None)
-        if up_weight is None or down_weight is None:
+        if fc1_weight is None or down_weight is None:
             raise ValueError('PAIR initialization requires explicit fc1 and fc2 weight tensors.')
-        if up_weight.is_meta or down_weight.is_meta:
+        if fc1_weight.is_meta or down_weight.is_meta:
             raise ValueError('PAIR initialization requires materialized fc1 and fc2 weights.')
-        if not up_weight.is_floating_point() or not down_weight.is_floating_point():
+        if not fc1_weight.is_floating_point() or not down_weight.is_floating_point():
             raise ValueError('PAIR initialization requires floating-point fc1 and fc2 weights.')
 
-        ffn_hidden_size, hidden_size = up_weight.shape
+        fc1_output_size, hidden_size = fc1_weight.shape
+        ffn_hidden_size = (
+            fc1_output_size // 2 if self.config.gated_linear_unit else fc1_output_size
+        )
         if tuple(down_weight.shape) != (hidden_size, ffn_hidden_size):
             raise ValueError(
-                'PAIR initialization requires fc1 [2m, d] and fc2 [d, 2m] with matching dimensions.'
+                'PAIR initialization requires fc1 and fc2 weights with matching FFN dimensions.'
             )
 
         pair_seed = self.config.pair_init_seed + 1_000_003 * layer_number
-        pair_up, pair_down = build_pair_mlp_weights(
-            hidden_size=hidden_size,
-            ffn_hidden_size=ffn_hidden_size,
-            activation_func=self.config.activation_func,
-            input_second_moment=self.config.pair_init_input_second_moment,
-            seed=pair_seed,
-        )
+        if self.config.gated_linear_unit:
+            pair_fc1, pair_down, paired_dimension, defect_dimension = (
+                build_pair_swiglu_mlp_weights(
+                    hidden_size=hidden_size,
+                    ffn_hidden_size=ffn_hidden_size,
+                    input_second_moment=self.config.pair_init_input_second_moment,
+                    seed=pair_seed,
+                )
+            )
+            if self.config.pair_diagnostics:
+                self._pair_initial_metrics = _pair_swiglu_initialization_diagnostics(
+                    fused_fc1_weight=pair_fc1,
+                    down_weight=pair_down,
+                    input_second_moment=self.config.pair_init_input_second_moment,
+                    seed=pair_seed,
+                    calibration_size=self.config.pair_diagnostics_calibration_size,
+                    paired_dimension=paired_dimension,
+                    defect_dimension=defect_dimension,
+                )
+        else:
+            pair_fc1, pair_down = build_pair_mlp_weights(
+                hidden_size=hidden_size,
+                ffn_hidden_size=ffn_hidden_size,
+                activation_func=self.config.activation_func,
+                input_second_moment=self.config.pair_init_input_second_moment,
+                seed=pair_seed,
+            )
+            if self.config.pair_diagnostics:
+                self._pair_initial_metrics = _pair_initialization_diagnostics(
+                    up_weight=pair_fc1,
+                    down_weight=pair_down,
+                    activation_func=self.config.activation_func,
+                    input_second_moment=self.config.pair_init_input_second_moment,
+                    seed=pair_seed,
+                    calibration_size=self.config.pair_diagnostics_calibration_size,
+                )
 
         with torch.no_grad():
-            up_weight.copy_(pair_up.to(device=up_weight.device, dtype=up_weight.dtype))
+            fc1_weight.copy_(pair_fc1.to(device=fc1_weight.device, dtype=fc1_weight.dtype))
             down_weight.copy_(pair_down.to(device=down_weight.device, dtype=down_weight.dtype))
-            up_bias = getattr(self.linear_fc1, 'bias', None)
+            fc1_bias = getattr(self.linear_fc1, 'bias', None)
             down_bias = getattr(self.linear_fc2, 'bias', None)
-            if up_bias is not None:
-                up_bias.zero_()
+            if fc1_bias is not None:
+                fc1_bias.zero_()
             if down_bias is not None:
                 down_bias.zero_()
+
+    def set_pair_diagnostics_collection(self, enabled: bool) -> None:
+        """Enable one bounded collection window for PAIR activation statistics."""
+        if enabled and not self.config.pair_init:
+            raise ValueError('PAIR diagnostics require PAIR-initialized MLP layers.')
+        self._pair_diagnostics_collect = enabled
+        self._pair_diagnostics_accumulator = None
+
+    @torch.no_grad()
+    def _accumulate_pair_diagnostics(
+        self,
+        hidden_states: torch.Tensor,
+        activated_hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        output_bias: Optional[torch.Tensor],
+    ) -> None:
+        if not self._pair_diagnostics_collect:
+            return
+        if activated_hidden_states.shape[-1] % 2 != 0:
+            raise ValueError('PAIR parity diagnostics require an even activation width.')
+
+        inputs = hidden_states.detach().float()
+        activated = activated_hidden_states.detach().float()
+        first_half, second_half = torch.chunk(activated, 2, dim=-1)
+        even_hidden = (first_half + second_half) / math.sqrt(2.0)
+        odd_hidden = (first_half - second_half) / math.sqrt(2.0)
+
+        diagnostic_output = output.detach().float()
+        if output_bias is not None:
+            diagnostic_output = diagnostic_output + output_bias.detach().float()
+
+        stats = torch.stack(
+            (
+                inputs.square().sum(),
+                inputs.new_tensor(float(inputs.numel())),
+                even_hidden.square().sum(),
+                odd_hidden.square().sum(),
+                inputs.new_tensor(float(first_half.numel())),
+                diagnostic_output.square().sum(),
+                inputs.new_tensor(float(diagnostic_output.numel())),
+            )
+        )
+        if self._pair_diagnostics_accumulator is None:
+            self._pair_diagnostics_accumulator = stats
+        else:
+            self._pair_diagnostics_accumulator.add_(stats)
+
+    def consume_pair_diagnostics(self) -> torch.Tensor:
+        """Return and clear the activation accumulator for the current collection window."""
+        if self._pair_diagnostics_accumulator is None:
+            raise RuntimeError('PAIR diagnostics were enabled but the MLP did not execute.')
+        accumulator = self._pair_diagnostics_accumulator
+        self._pair_diagnostics_accumulator = None
+        self._pair_diagnostics_collect = False
+        return accumulator
+
+    def consume_pair_initial_metrics(self) -> dict[str, float]:
+        """Return the construction diagnostics once without adding checkpoint state."""
+        metrics = self._pair_initial_metrics
+        self._pair_initial_metrics = {}
+        return metrics
 
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
@@ -441,6 +835,10 @@ class MLP(MegatronModule):
 
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
+
+        self._accumulate_pair_diagnostics(
+            hidden_states, intermediate_parallel, output, output_bias
+        )
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly

@@ -408,8 +408,8 @@ class PionOptimizer(Optimizer):
         split_qkv: bool = True,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         qkv_split_shapes: Optional[Tuple[int, int, int]] = None,
-        split_fc1_up_gate: bool = True,
-        is_fc1_up_gate_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        split_fc1_gate_up: bool = True,
+        is_fc1_gate_up_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         split_qkv_per_head: bool = True,
         qkv_split_granularity: Optional[str] = None,
         pion_scaling: str = "rms",
@@ -448,9 +448,9 @@ class PionOptimizer(Optimizer):
         self.split_qkv = split_qkv and (qkv_split_shapes is not None) and (is_qkv_fn is not None)
         self.is_qkv_fn = is_qkv_fn if is_qkv_fn is not None else (lambda p: False)
         self.qkv_split_shapes = tuple(qkv_split_shapes) if qkv_split_shapes else (0, 0, 0)
-        self.split_fc1_up_gate = split_fc1_up_gate and (is_fc1_up_gate_fn is not None)
-        self.is_fc1_up_gate_fn = (
-            is_fc1_up_gate_fn if is_fc1_up_gate_fn is not None else (lambda p: False)
+        self.split_fc1_gate_up = split_fc1_gate_up and (is_fc1_gate_up_fn is not None)
+        self.is_fc1_gate_up_fn = (
+            is_fc1_gate_up_fn if is_fc1_gate_up_fn is not None else (lambda p: False)
         )
         self.split_qkv_per_head = split_qkv_per_head
         self.qkv_split_granularity = resolved_qkv_granularity
@@ -719,19 +719,20 @@ class PionOptimizer(Optimizer):
             p.data.copy_(new_p.to(dtype=p.data.dtype) if new_p.dtype != p.data.dtype else new_p)
             return
 
-        if self.split_fc1_up_gate and self.is_fc1_up_gate_fn(p):
+        if self.split_fc1_gate_up and self.is_fc1_gate_up_fn(p):
+            # Megatron SwiGLU stores the activated gate first and the linear up branch second.
             half = out_dim // 2
-            w_up = p_data[:half].clone()
-            w_gate = p_data[half:].clone()
-            g_up = grad_f[:half]
-            g_gate = grad_f[half:]
-            self._update_and_maybe_log(
-                w_up, g_up, group, state, "fc1_up", param_name, should_log
-            )
+            w_gate = p_data[:half].clone()
+            w_up = p_data[half:].clone()
+            g_gate = grad_f[:half]
+            g_up = grad_f[half:]
             self._update_and_maybe_log(
                 w_gate, g_gate, group, state, "fc1_gate", param_name, should_log
             )
-            new_p = torch.cat([w_up, w_gate], dim=0)
+            self._update_and_maybe_log(
+                w_up, g_up, group, state, "fc1_up", param_name, should_log
+            )
+            new_p = torch.cat([w_gate, w_up], dim=0)
             p.data.copy_(new_p.to(dtype=p.data.dtype) if new_p.dtype != p.data.dtype else new_p)
             return
 
@@ -795,7 +796,7 @@ def get_megatron_pion_optimizer(
     matrix_params: List[torch.nn.Parameter] = []
     non_matrix_params: List[torch.nn.Parameter] = []
     qkv_split_shapes: Optional[Tuple[int, int, int]] = None
-    split_fc1_up_gate = False
+    split_fc1_gate_up = False
 
     for model_chunk in model_chunks:
         num_attention_heads = getattr(model_chunk.config, "num_attention_heads", None)
@@ -808,7 +809,7 @@ def get_megatron_pion_optimizer(
                 kv_channels,
             )
         gated_linear_unit = getattr(model_chunk.config, "gated_linear_unit", False)
-        split_fc1_up_gate = gated_linear_unit and getattr(config, "pion_split_gate", True)
+        split_fc1_gate_up = gated_linear_unit and getattr(config, "pion_split_gate", True)
 
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
@@ -817,8 +818,8 @@ def get_megatron_pion_optimizer(
                 setattr(param, "_pion_param_name", name)
                 if "linear_qkv.weight" in name:
                     param.is_qkv = True
-                if "linear_fc1.weight" in name and split_fc1_up_gate:
-                    param.is_fc1_up_gate = True
+                if "linear_fc1.weight" in name and split_fc1_gate_up:
+                    param.is_fc1_gate_up = True
                 matrix_params.append(param)
                 log_single_rank(logger, logging.DEBUG, f"matrix_params: {name} {param.shape}")
             else:
@@ -887,8 +888,8 @@ def get_megatron_pion_optimizer(
         split_qkv=getattr(config, "pion_split_qkv", True),
         is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
         qkv_split_shapes=qkv_split_shapes,
-        split_fc1_up_gate=split_fc1_up_gate,
-        is_fc1_up_gate_fn=lambda p: getattr(p, "is_fc1_up_gate", False),
+        split_fc1_gate_up=split_fc1_gate_up,
+        is_fc1_gate_up_fn=lambda p: getattr(p, "is_fc1_gate_up", False),
         split_qkv_per_head=getattr(config, "pion_split_qkv_per_head", True),
         qkv_split_granularity=pion_qkv_split_granularity,
         pion_scaling=pion_scaling,

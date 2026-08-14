@@ -4,6 +4,8 @@
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
+_GENERALIZATION_TRAIN_NLL_SUM = None
+_GENERALIZATION_TRAIN_NLL_STEPS = 0
 import csv
 import os
 from pathlib import Path
@@ -195,6 +197,12 @@ from .global_vars import (
 from . import one_logger_utils
 
 from . import ft_integration
+from .pair_diagnostics import (
+    begin_pair_diagnostics,
+    capture_pair_diagnostics,
+    finish_pair_diagnostics,
+    pair_diagnostics_due,
+)
 
 stimer = StragglerDetector()
 
@@ -1386,7 +1394,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # apply_spectral_norm_init_to_model(model, args.init_spectral_norm_scale)
         apply_spectral_norm_init_to_model(model,args.init_spectral_norm_scale,split_gate=getattr(args, 'pion_split_gate', True),split_qkv_per_head=getattr(args, 'pion_split_qkv_per_head', True))
         
-        # Print spectral norm of all 2D params in first Transformer block (Q,K,V, o_project, up_project, gate_project, down_project, and any others).
+        # Print spectral norm of all 2D params in first Transformer block (Q,K,V, o_project, gate_project, up_project, down_project, and any others).
         m = model[0]
         inner = getattr(m, 'module', m)
         if hasattr(inner, 'decoder') and hasattr(inner.decoder, 'layers') and len(inner.decoder.layers) > 0:
@@ -1405,7 +1413,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 total_per_group = None
             DISPLAY_NAMES = {
                 'self_attention.linear_proj.weight': 'o_project',
-                'mlp.linear_fc1.weight': 'up_project',
+                'mlp.linear_fc1.weight': 'gate_up_project',
                 'mlp.linear_fc2.weight': 'down_project',
             }
             parts = []
@@ -1447,12 +1455,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                             parts.append(f'{qkv_name}={sn:.6f}')
                 elif 'mlp.linear_fc1.weight' in name and gated_linear_unit and getattr(args, 'pion_split_gate', True):
                     half = w.shape[0] // 2
-                    # sn_up = torch.linalg.norm(w[:half], 2).item()
-                    # sn_gate = torch.linalg.norm(w[half:], 2).item()
-                    sn_up = torch.linalg.norm(w[:half], 'fro').item()
-                    sn_gate = torch.linalg.norm(w[half:], 'fro').item()
-                    parts.append(f'up_project={sn_up:.6f}')
+                    # sn_gate = torch.linalg.norm(w[:half], 2).item()
+                    # sn_up = torch.linalg.norm(w[half:], 2).item()
+                    sn_gate = torch.linalg.norm(w[:half], 'fro').item()
+                    sn_up = torch.linalg.norm(w[half:], 'fro').item()
                     parts.append(f'gate_project={sn_gate:.6f}')
+                    parts.append(f'up_project={sn_up:.6f}')
                 else:
                     # sn = torch.linalg.norm(w, 2).item()
                     sn = torch.linalg.norm(w, 'fro').item()
@@ -1872,6 +1880,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    pair_modules = begin_pair_diagnostics(model) if pair_diagnostics_due(args) else None
 
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -1913,7 +1922,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, {}
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1925,6 +1934,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
+
+    pair_metrics = {}
+    pair_snapshots = []
+    if pair_modules is not None:
+        pair_metrics, pair_snapshots = capture_pair_diagnostics(
+            pair_modules,
+            include_initial_metrics=(
+                args.curr_iteration == 0 and args.consumed_train_samples == 0
+            ),
+        )
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -1940,6 +1959,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful)
+    if pair_modules is not None:
+        pair_metrics.update(
+            finish_pair_diagnostics(pair_snapshots, bool(update_successful))
+        )
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
@@ -1993,8 +2016,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            pair_metrics,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return (
+        {},
+        skipped_iter,
+        should_checkpoint,
+        should_exit,
+        exit_code,
+        grad_norm,
+        num_zeros_in_grad,
+        log_max_attention_logit,
+        pair_metrics,
+    )
 
 
 def training_log(
@@ -2011,8 +2045,11 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    pair_metrics=None,
 ):
     """Log training information such as losses, timing, ...."""
+    global _GENERALIZATION_TRAIN_NLL_SUM, _GENERALIZATION_TRAIN_NLL_STEPS
+
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -2048,6 +2085,13 @@ def training_log(
             is_nan = value == float('inf') or value == -float('inf') or value != value
             got_nan = got_nan or is_nan
     total_loss_dict[nan_iters_key] = total_loss_dict.get(nan_iters_key, 0) + int(got_nan)
+
+    if not skipped_iter and 'lm loss' in loss_dict:
+        train_nll = loss_dict['lm loss'].detach()
+        if _GENERALIZATION_TRAIN_NLL_SUM is None:
+            _GENERALIZATION_TRAIN_NLL_SUM = torch.zeros_like(train_nll)
+        _GENERALIZATION_TRAIN_NLL_SUM.add_(train_nll)
+        _GENERALIZATION_TRAIN_NLL_STEPS += 1
 
     # Logging.
     timers_to_log = []
@@ -2094,6 +2138,7 @@ def training_log(
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    consumed_train_tokens = args.consumed_train_samples * args.seq_length
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -2105,9 +2150,17 @@ def training_log(
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
-            wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
+            wandb_writer.log(
+                {
+                    'samples vs steps': args.consumed_train_samples,
+                    'consumed-train-tokens': consumed_train_tokens,
+                },
+                iteration,
+            )
+        writer.add_scalar('consumed-train-tokens', consumed_train_tokens, iteration)
         writer.add_scalar('learning-rate', learning_rate, iteration)
         writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
+        writer.add_scalar('learning-rate vs tokens', learning_rate, consumed_train_tokens)
         if wandb_writer:
             wandb_writer.log({'learning-rate': learning_rate}, iteration)
         if args.skipped_train_samples > 0:
@@ -2128,8 +2181,20 @@ def training_log(
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
+            writer.add_scalar(key + ' vs tokens', loss_dict[key], consumed_train_tokens)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
+            if key == 'lm loss':
+                train_nll = float(loss_dict[key])
+                train_ppl = math.exp(min(20.0, train_nll))
+                writer.add_scalar('train/nll', train_nll, iteration)
+                writer.add_scalar('train/nll vs tokens', train_nll, consumed_train_tokens)
+                writer.add_scalar('train/ppl', train_ppl, iteration)
+                writer.add_scalar('train/ppl vs tokens', train_ppl, consumed_train_tokens)
+                if wandb_writer:
+                    wandb_writer.log(
+                        {'train/nll': train_nll, 'train/ppl': train_ppl}, iteration
+                    )
         if args.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
@@ -2178,6 +2243,43 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+
+    if pair_metrics:
+        if writer:
+            for metric_name, metric_value in pair_metrics.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+                writer.add_scalar(
+                    metric_name + ' vs tokens', metric_value, consumed_train_tokens
+                )
+        if wandb_writer:
+            pair_wandb_metrics = dict(pair_metrics)
+            pair_wandb_metrics['pair/consumed_train_tokens'] = consumed_train_tokens
+            wandb_writer.log(pair_wandb_metrics, iteration)
+        if is_last_rank() and args.save:
+            os.makedirs(args.save, exist_ok=True)
+            pair_csv_path = os.path.join(args.save, 'pair_diagnostics.csv')
+            pair_csv_exists = os.path.isfile(pair_csv_path)
+            with open(pair_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+                fieldnames = [
+                    'iteration',
+                    'consumed_train_samples',
+                    'consumed_train_tokens',
+                    'metric',
+                    'value',
+                ]
+                pair_csv_writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                if not pair_csv_exists:
+                    pair_csv_writer.writeheader()
+                for metric_name in sorted(pair_metrics):
+                    pair_csv_writer.writerow(
+                        {
+                            'iteration': iteration,
+                            'consumed_train_samples': args.consumed_train_samples,
+                            'consumed_train_tokens': consumed_train_tokens,
+                            'metric': metric_name,
+                            'value': f'{pair_metrics[metric_name]:.9E}',
+                        }
+                    )
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -2250,6 +2352,9 @@ def training_log(
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
+        tokens_per_second_per_gpu = (
+            batch_size * args.seq_length / (elapsed_time_per_iteration * args.world_size)
+        )
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -2264,6 +2369,7 @@ def training_log(
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
+        log_string += ' consumed tokens: {:14d} |'.format(consumed_train_tokens)
         
         # 添加总训练时间估计和剩余时间
         if iteration > 0 and not is_first_iteration:
@@ -2298,11 +2404,23 @@ def training_log(
         )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            log_string += (
+                f' tokens per second per GPU: {tokens_per_second_per_gpu:.1f} |'
+            )
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
+                    writer.add_scalar(
+                        'tokens-per-second-per-gpu', tokens_per_second_per_gpu, iteration
+                    )
                 if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_writer.log(
+                        {
+                            'throughput': throughput,
+                            'tokens-per-second-per-gpu': tokens_per_second_per_gpu,
+                        },
+                        iteration,
+                    )
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
@@ -3036,6 +3154,7 @@ def train(
             grad_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            pair_metrics,
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
@@ -3153,6 +3272,7 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            pair_metrics=pair_metrics,
         )
         is_first_iteration = False
 
@@ -3572,7 +3692,15 @@ def evaluate_and_print_results(
     non_loss_data_func=None,
 ):
     """Helper function to evaluate and dump results on screen."""
+    global _GENERALIZATION_TRAIN_NLL_SUM, _GENERALIZATION_TRAIN_NLL_STEPS
+
     args = get_args()
+    consumed_train_tokens = args.consumed_train_samples * args.seq_length
+    train_window_nll = None
+    if _GENERALIZATION_TRAIN_NLL_STEPS > 0:
+        train_window_nll = float(
+            _GENERALIZATION_TRAIN_NLL_SUM / _GENERALIZATION_TRAIN_NLL_STEPS
+        )
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
@@ -3654,25 +3782,90 @@ def evaluate_and_print_results(
             return
         string = f' validation{suffix} loss at {prefix} | '
         for key in total_loss_dict:
-            string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-            ppl = math.exp(min(20, total_loss_dict[key].item()))
+            validation_value = total_loss_dict[key].item()
+            string += '{} value: {:.6E} | '.format(key, validation_value)
+            ppl = math.exp(min(20, validation_value))
             string += '{} PPL: {:.6E} | '.format(key, ppl)
             if writer:
-                writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
+                writer.add_scalar('{} validation{}'.format(key, suffix), validation_value, iteration)
                 writer.add_scalar(
                     '{} validation{} vs samples'.format(key, suffix),
-                    total_loss_dict[key].item(),
+                    validation_value,
                     args.consumed_train_samples,
+                )
+                writer.add_scalar(
+                    '{} validation{} vs tokens'.format(key, suffix),
+                    validation_value,
+                    consumed_train_tokens,
                 )
                 if args.log_validation_ppl_to_tensorboard:
                     writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
                     )
-                if wandb_writer and is_last_rank():
-                    wandb_writer.log(
-                        {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
+                    writer.add_scalar(
+                        '{} validation{} ppl vs tokens'.format(key, suffix),
+                        ppl,
+                        consumed_train_tokens,
                     )
+                if key == 'lm loss':
+                    generalization_prefix = f'generalization/validation{suffix}'
+                    writer.add_scalar(
+                        f'{generalization_prefix}/nll', validation_value, iteration
+                    )
+                    writer.add_scalar(
+                        f'{generalization_prefix}/nll vs tokens',
+                        validation_value,
+                        consumed_train_tokens,
+                    )
+                    writer.add_scalar(f'{generalization_prefix}/ppl', ppl, iteration)
+                    writer.add_scalar(
+                        f'{generalization_prefix}/ppl vs tokens',
+                        ppl,
+                        consumed_train_tokens,
+                    )
+                    if train_window_nll is not None:
+                        train_window_ppl = math.exp(min(20, train_window_nll))
+                        nll_gap = validation_value - train_window_nll
+                        writer.add_scalar(
+                            f'{generalization_prefix}/train_window_nll',
+                            train_window_nll,
+                            iteration,
+                        )
+                        writer.add_scalar(
+                            f'{generalization_prefix}/train_window_ppl',
+                            train_window_ppl,
+                            iteration,
+                        )
+                        writer.add_scalar(
+                            f'{generalization_prefix}/nll_gap', nll_gap, iteration
+                        )
+                        writer.add_scalar(
+                            f'{generalization_prefix}/train_window_steps',
+                            _GENERALIZATION_TRAIN_NLL_STEPS,
+                            iteration,
+                        )
+                if wandb_writer and is_last_rank():
+                    validation_metrics = {
+                        '{} validation{}'.format(key, suffix): validation_value,
+                        '{} validation{} ppl'.format(key, suffix): ppl,
+                        'generalization/consumed_train_tokens': consumed_train_tokens,
+                    }
+                    if key == 'lm loss':
+                        generalization_prefix = f'generalization/validation{suffix}'
+                        validation_metrics[f'{generalization_prefix}/nll'] = validation_value
+                        validation_metrics[f'{generalization_prefix}/ppl'] = ppl
+                        if train_window_nll is not None:
+                            validation_metrics[
+                                f'{generalization_prefix}/train_window_nll'
+                            ] = train_window_nll
+                            validation_metrics[
+                                f'{generalization_prefix}/train_window_ppl'
+                            ] = math.exp(min(20, train_window_nll))
+                            validation_metrics[f'{generalization_prefix}/nll_gap'] = (
+                                validation_value - train_window_nll
+                            )
+                    wandb_writer.log(validation_metrics, iteration)
 
         if process_non_loss_data_func is not None and writer and is_last_rank():
             process_non_loss_data_func(collected_non_loss_data, iteration, writer)
@@ -3681,6 +3874,59 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+        if is_last_rank() and args.save and 'lm loss' in total_loss_dict:
+            os.makedirs(args.save, exist_ok=True)
+            generalization_csv_path = os.path.join(
+                args.save, 'generalization_metrics.csv'
+            )
+            generalization_csv_exists = os.path.isfile(generalization_csv_path)
+            validation_nll = total_loss_dict['lm loss'].item()
+            validation_ppl = math.exp(min(20, validation_nll))
+            with open(
+                generalization_csv_path, 'a', newline='', encoding='utf-8'
+            ) as csvfile:
+                fieldnames = [
+                    'iteration',
+                    'consumed_train_samples',
+                    'consumed_train_tokens',
+                    'validation_set',
+                    'validation_nll',
+                    'validation_ppl',
+                    'train_window_steps',
+                    'train_window_nll',
+                    'train_window_ppl',
+                    'nll_gap',
+                ]
+                generalization_csv_writer = csv.DictWriter(
+                    csvfile, fieldnames=fieldnames
+                )
+                if not generalization_csv_exists:
+                    generalization_csv_writer.writeheader()
+                generalization_csv_writer.writerow(
+                    {
+                        'iteration': iteration,
+                        'consumed_train_samples': args.consumed_train_samples,
+                        'consumed_train_tokens': consumed_train_tokens,
+                        'validation_set': suffix.removeprefix('-') or 'default',
+                        'validation_nll': f'{validation_nll:.9E}',
+                        'validation_ppl': f'{validation_ppl:.9E}',
+                        'train_window_steps': _GENERALIZATION_TRAIN_NLL_STEPS,
+                        'train_window_nll': (
+                            '' if train_window_nll is None else f'{train_window_nll:.9E}'
+                        ),
+                        'train_window_ppl': (
+                            ''
+                            if train_window_nll is None
+                            else f'{math.exp(min(20, train_window_nll)):.9E}'
+                        ),
+                        'nll_gap': (
+                            ''
+                            if train_window_nll is None
+                            else f'{validation_nll - train_window_nll:.9E}'
+                        ),
+                    }
+                )
     # ========== 添加 CSV 记录功能 ==========
     # 只在最后一个 rank 上写入 CSV，避免多进程重复写入
     if is_last_rank():
@@ -3727,6 +3973,9 @@ def evaluate_and_print_results(
                     })
             
             print_rank_0(f'Validation metrics saved to {csv_file_path}')
+
+    _GENERALIZATION_TRAIN_NLL_SUM = None
+    _GENERALIZATION_TRAIN_NLL_STEPS = 0
 
 
 def cyclic_iter(iter):

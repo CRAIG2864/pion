@@ -304,13 +304,19 @@ class TransformerConfig(ModelParallelConfig):
     init_method and output_layer_init_method are provided."""
 
     pair_init: bool = False
-    """Apply the coupled PAIR initialization to the two projections in each dense MLP."""
+    """Apply the coupled PAIR initialization to dense GELU or fused SwiGLU MLP weights."""
 
     pair_init_input_second_moment: float = 1.0
     """Mean squared coordinate value at the input of a PAIR-initialized MLP."""
 
     pair_init_seed: int = 1234
     """Base seed used to construct deterministic, layer-specific PAIR orientations."""
+
+    pair_diagnostics: bool = False
+    """Collect bounded PAIR initialization, activation, gradient, and update diagnostics."""
+
+    pair_diagnostics_calibration_size: int = 16
+    """Number of deterministic calibration columns used by one-time PAIR structural checks."""
 
     embedding_init_method: Optional[Callable] = None
     """

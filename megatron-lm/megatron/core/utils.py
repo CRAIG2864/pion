@@ -890,7 +890,7 @@ def _scatter_full_weight_after_spectral_norm(param, full_w):
         shard = full_w[:, rank * local_in : (rank + 1) * local_in]
         param.data.copy_(shard.to(param.dtype).contiguous())
 
-# This version does not split up_project and gate_project for spectral norm init (SwiGLU).
+# This version does not split gate_project and up_project for spectral norm init (SwiGLU).
 # def apply_spectral_norm_init_to_model(model_list, scale: float = 1.0):
 #     """
 #     对模型中所有二阶参数（排除 embedding / output）做 spectral norm 归一化后乘 scale。
@@ -1015,7 +1015,7 @@ def apply_spectral_norm_init_to_model(model_list, scale: float = 1.0, split_gate
     对模型中所有二阶参数（排除 embedding / output）做 spectral norm 归一化后乘 scale。
     对 linear_qkv：先按 TP 聚合成完整矩阵，再按 GQA/MHA 布局对 Q、K、V 分别做 spectral norm
     （与 Pion/Muon 的 qkv_split_shapes 一致：num_heads/num_query_groups*kv_channels, kv_channels, kv_channels 每组）。
-    SwiGLU 下 linear_fc1：当 no_split_gate=False 时，对 up_project 与 gate_project 分行各做 spectral norm 再乘 scale；
+    SwiGLU 下 linear_fc1：当 no_split_gate=False 时，对 gate_project 与 up_project 分行各做 spectral norm 再乘 scale；
     当 no_split_gate=True 或非 SwiGLU 时，整块矩阵做一次 spectral norm。
     model_list: 单个 model 或 list of model（与 training.py 里 model 一致）。
     """
@@ -1099,13 +1099,13 @@ def apply_spectral_norm_init_to_model(model_list, scale: float = 1.0, split_gate
                             # block.mul_(scale)
                     _scatter_full_weight_after_spectral_norm(param, full_w)
                 elif 'linear_fc1' in name and name.endswith('.weight') and gated_linear_unit and split_gate:
-                    # SwiGLU: split up_project (first half) and gate_project (second half), scale each by same scale
+                    # SwiGLU: split gate_project (first half) and up_project (second half), scale each by same scale
                     full_w = _gather_full_weight_for_spectral_norm(param, w)
                     out_dim, in_dim = full_w.shape
                     half = out_dim // 2
-                    w_up = full_w[:half]
-                    w_gate = full_w[half:]
-                    for block in (w_up, w_gate):
+                    w_gate = full_w[:half]
+                    w_up = full_w[half:]
+                    for block in (w_gate, w_up):
                         sn = torch.linalg.norm(block, 2).clamp(min=1e-12)
                         block.div_(sn).mul_(scale)
                         # block.mul_(scale)

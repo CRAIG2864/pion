@@ -1116,14 +1116,30 @@ def validate_args(args, defaults={}):
             raise ValueError('--pair-init requires --tensor-model-parallel-size 1.')
         if args.num_experts is not None:
             raise ValueError('--pair-init supports dense MLP layers only.')
-        if args.swiglu or args.squared_relu or args.quick_geglu:
-            raise ValueError('--pair-init currently requires the standard GELU activation.')
+        if args.squared_relu or args.quick_geglu:
+            raise ValueError('--pair-init supports the standard GELU and SwiGLU activations.')
         if args.init_spectral_norm_scale is not None:
             raise ValueError('--pair-init cannot be combined with --init-spectral-norm-scale.')
         if args.init_model_with_meta_device:
             raise ValueError('--pair-init requires materialized parameters during model construction.')
         if args.pair_init_input_second_moment <= 0.0:
             raise ValueError('--pair-init-input-second-moment must be positive.')
+
+    if args.pair_diagnostics:
+        if not args.pair_init:
+            raise ValueError('--pair-diagnostics requires --pair-init.')
+        if args.pipeline_model_parallel_size != 1:
+            raise ValueError('--pair-diagnostics requires --pipeline-model-parallel-size 1.')
+        if args.recompute_granularity is not None:
+            raise ValueError('--pair-diagnostics does not support activation recomputation.')
+        if args.pair_diagnostics_interval <= 0:
+            raise ValueError('--pair-diagnostics-interval must be positive.')
+        if args.pair_diagnostics_calibration_size <= 0:
+            raise ValueError('--pair-diagnostics-calibration-size must be positive.')
+        if not args.pair_diagnostics_steps or any(
+            step <= 0 for step in args.pair_diagnostics_steps
+        ):
+            raise ValueError('--pair-diagnostics-steps must contain positive iterations.')
 
     # Context parallel
     if args.context_parallel_size > 1:
@@ -2527,8 +2543,8 @@ def _add_training_args(parser):
                    help='Disable splitting Q/K/V for linear_qkv in Pion (only for --optimizer pion).')                   
     group.add_argument('--pion-no-split-gate', action='store_false', default=True,
                        dest='pion_split_gate',
-                       help='Disable splitting up/gate for SwiGLU linear_fc1 in Pion and spectral norm init (only for --optimizer pion). '
-                            'By default up_project and gate_project are split.')
+                       help='Disable splitting gate/up for SwiGLU linear_fc1 in Pion and spectral norm init (only for --optimizer pion). '
+                            'By default gate_project and up_project are split.')
     group.add_argument('--pion-no-split-qkv-per-head', action='store_false', default=True,
                        dest='pion_split_qkv_per_head',
                        help='Disable split-head Q update; equivalent to --pion-qkv-split-granularity qkv unless explicitly overridden.')
@@ -2707,9 +2723,18 @@ def _add_initialization_args(parser):
                        'embedding and lm_head) by spectral norm and multiply by this scale.')
     group.add_argument('--pair-init', action='store_true',
                        help='After the standard linear-layer initialization, jointly overwrite '
-                       'the two projections in every dense MLP with PAIR initialization.')
+                       'the dense GELU projections or fused SwiGLU gate, up, and down weights '
+                       'with PAIR initialization.')
     group.add_argument('--pair-init-input-second-moment', type=float, default=1.0,
                        help='Mean squared coordinate value at the input of each PAIR-initialized MLP.')
+    group.add_argument('--pair-diagnostics', action='store_true',
+                       help='Record bounded PAIR initialization, activation, gradient, and update metrics.')
+    group.add_argument('--pair-diagnostics-interval', type=int, default=1000,
+                       help='Collect PAIR runtime diagnostics at every Nth optimizer step.')
+    group.add_argument('--pair-diagnostics-steps', type=int, nargs='+', default=[1, 10, 100],
+                       help='Additional optimizer steps at which PAIR runtime diagnostics are collected.')
+    group.add_argument('--pair-diagnostics-calibration-size', type=int, default=16,
+                       help='Calibration columns used by the one-time PAIR structural diagnostics.')
     group.add_argument('--use-same-init-for-output-layers', action='store_true',
                        help='Use the same init (init_method) for output layers as for'
                        'Q/K/V and gate/up, instead of scaled_init (smaller std).')

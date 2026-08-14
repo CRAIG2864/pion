@@ -58,7 +58,7 @@ except ImportError:
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
-    "is_fc1_up_gate": False,   # 与 is_qkv 一致，供 Pion 在 main_param 上识别 fc1 up/gate 分割
+    "is_fc1_gate_up": False,   # 与 is_qkv 一致，供 Pion 在 main_param 上识别 fc1 gate/up 分割
     "split_qkv_per_head": False,
     "tensor_model_parallel": False,
     "partition_dim": -1,

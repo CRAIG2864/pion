@@ -314,7 +314,7 @@ class OptimizerConfig:
     """Whether to split QKV parameters for Pion optimizer."""
 
     pion_split_gate: bool = True
-    """When True, split up_project and gate_project for SwiGLU linear_fc1 in Pion and in spectral norm init (same style as pion_split_qkv)."""
+    """When True, split gate_project and up_project for SwiGLU linear_fc1 in Pion and in spectral norm init (same style as pion_split_qkv)."""
 
     pion_split_qkv_per_head: bool = True
     """Whether to split Q/K/V per head (per group in GQA) in Pion and in spectral norm init. Same style as pion_split_gate."""
