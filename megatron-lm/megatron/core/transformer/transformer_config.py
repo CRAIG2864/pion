@@ -303,6 +303,15 @@ class TransformerConfig(ModelParallelConfig):
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
 
+    pair_init: bool = False
+    """Apply the coupled PAIR initialization to the two projections in each dense MLP."""
+
+    pair_init_input_second_moment: float = 1.0
+    """Mean squared coordinate value at the input of a PAIR-initialized MLP."""
+
+    pair_init_seed: int = 1234
+    """Base seed used to construct deterministic, layer-specific PAIR orientations."""
+
     embedding_init_method: Optional[Callable] = None
     """
     Method to initialize weights of the embedding layer. If None, will be set as described 

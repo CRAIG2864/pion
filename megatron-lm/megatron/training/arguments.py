@@ -1109,6 +1109,22 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
+    if args.pair_init:
+        if args.use_legacy_models:
+            raise ValueError('--pair-init requires Megatron Core models.')
+        if args.tensor_model_parallel_size != 1:
+            raise ValueError('--pair-init requires --tensor-model-parallel-size 1.')
+        if args.num_experts is not None:
+            raise ValueError('--pair-init supports dense MLP layers only.')
+        if args.swiglu or args.squared_relu or args.quick_geglu:
+            raise ValueError('--pair-init currently requires the standard GELU activation.')
+        if args.init_spectral_norm_scale is not None:
+            raise ValueError('--pair-init cannot be combined with --init-spectral-norm-scale.')
+        if args.init_model_with_meta_device:
+            raise ValueError('--pair-init requires materialized parameters during model construction.')
+        if args.pair_init_input_second_moment <= 0.0:
+            raise ValueError('--pair-init-input-second-moment must be positive.')
+
     # Context parallel
     if args.context_parallel_size > 1:
         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
@@ -1416,6 +1432,7 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+    kw_args['pair_init_seed'] = args.seed
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['layernorm_epsilon'] = args.norm_epsilon
@@ -2688,6 +2705,11 @@ def _add_initialization_args(parser):
     group.add_argument('--init-spectral-norm-scale', type=float, default=None,
                        help='If set, after default init, normalize all 2D weights (except '
                        'embedding and lm_head) by spectral norm and multiply by this scale.')
+    group.add_argument('--pair-init', action='store_true',
+                       help='After the standard linear-layer initialization, jointly overwrite '
+                       'the two projections in every dense MLP with PAIR initialization.')
+    group.add_argument('--pair-init-input-second-moment', type=float, default=1.0,
+                       help='Mean squared coordinate value at the input of each PAIR-initialized MLP.')
     group.add_argument('--use-same-init-for-output-layers', action='store_true',
                        help='Use the same init (init_method) for output layers as for'
                        'Q/K/V and gate/up, instead of scaled_init (smaller std).')

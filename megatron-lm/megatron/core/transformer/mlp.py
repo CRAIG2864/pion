@@ -2,6 +2,7 @@
 
 import gc
 import logging
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -41,6 +42,168 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _RandomizedDCTFactors:
+    """Factors for Q = P1 D1 C P2 D2 C P3 with orthonormal DCT-II matrix C."""
+
+    permutation_1: torch.Tensor
+    signs_1: torch.Tensor
+    permutation_2: torch.Tensor
+    signs_2: torch.Tensor
+    permutation_3: torch.Tensor
+
+
+def _orthonormal_dct_ii(vectors: torch.Tensor) -> torch.Tensor:
+    """Apply an orthonormal DCT-II to batches of row-stored column vectors."""
+    size = vectors.shape[-1]
+    if size < 1:
+        raise ValueError('The DCT dimension must be positive.')
+
+    reordered = torch.cat(
+        (vectors[..., ::2], vectors[..., 1::2].flip(dims=(-1,))), dim=-1
+    )
+    spectrum = torch.fft.fft(reordered, dim=-1)
+    phase = -math.pi * torch.arange(size, dtype=vectors.dtype, device=vectors.device)
+    phase = phase / (2.0 * size)
+    transformed = spectrum.real * torch.cos(phase) - spectrum.imag * torch.sin(phase)
+    transformed[..., 0] /= math.sqrt(size)
+    if size > 1:
+        transformed[..., 1:] /= math.sqrt(size / 2.0)
+    return transformed
+
+
+def _rademacher_signs(size: int, generator: torch.Generator) -> torch.Tensor:
+    signs = torch.randint(0, 2, (size,), generator=generator, dtype=torch.int64)
+    return signs.mul(2).sub(1).to(dtype=torch.float64)
+
+
+def _randomized_dct_factors(
+    size: int, generator: torch.Generator
+) -> _RandomizedDCTFactors:
+    return _RandomizedDCTFactors(
+        permutation_1=torch.randperm(size, generator=generator),
+        signs_1=_rademacher_signs(size, generator),
+        permutation_2=torch.randperm(size, generator=generator),
+        signs_2=_rademacher_signs(size, generator),
+        permutation_3=torch.randperm(size, generator=generator),
+    )
+
+
+def _apply_randomized_dct(
+    vectors: torch.Tensor, factors: _RandomizedDCTFactors
+) -> torch.Tensor:
+    """Apply the randomized orthogonal transform represented by ``factors``."""
+    result = vectors.index_select(-1, factors.permutation_3)
+    result = _orthonormal_dct_ii(result)
+    result = result * factors.signs_2
+    result = result.index_select(-1, factors.permutation_2)
+    result = _orthonormal_dct_ii(result)
+    result = result * factors.signs_1
+    return result.index_select(-1, factors.permutation_1)
+
+
+def _antipodal_parseval_frame(
+    row_count: int, column_count: int, generator: torch.Generator
+) -> torch.Tensor:
+    """Construct the full or maximal-partial antipodal Parseval frame from PAIR."""
+    if row_count >= 2 * column_count:
+        half_rows = row_count // 2
+        factors = _randomized_dct_factors(half_rows, generator)
+        selected_columns = torch.randperm(half_rows, generator=generator)[:column_count]
+        selected_basis = torch.zeros(column_count, half_rows, dtype=torch.float64)
+        selected_basis[torch.arange(column_count), selected_columns] = 1.0
+        frame_half = _apply_randomized_dct(selected_basis, factors).transpose(0, 1)
+        frame = torch.cat((frame_half, -frame_half), dim=0) / math.sqrt(2.0)
+        if row_count % 2 == 1:
+            frame = torch.cat(
+                (frame, torch.zeros(1, column_count, dtype=torch.float64)), dim=0
+            )
+    else:
+        paired_rows = row_count - column_count
+        factors = _randomized_dct_factors(column_count, generator)
+        orthogonal = _apply_randomized_dct(
+            torch.eye(column_count, dtype=torch.float64), factors
+        ).transpose(0, 1)
+        frame = torch.cat(
+            (
+                orthogonal[:paired_rows] / math.sqrt(2.0),
+                -orthogonal[:paired_rows] / math.sqrt(2.0),
+                orthogonal[paired_rows:],
+            ),
+            dim=0,
+        )
+
+    row_permutation = torch.randperm(row_count, generator=generator)
+    return frame.index_select(0, row_permutation)
+
+
+def _right_multiply_reverse_pair_j0_transpose(vectors: torch.Tensor) -> torch.Tensor:
+    half = vectors.shape[-1] // 2
+    return torch.cat(
+        (-vectors[..., half:].flip(dims=(-1,)), vectors[..., :half].flip(dims=(-1,))),
+        dim=-1,
+    )
+
+
+def _pair_activation_gamma(activation_func) -> float:
+    if activation_func is F.gelu:
+        return 1.823403463
+    if activation_func is F.relu:
+        return 2.0
+    if activation_func is F.silu:
+        return 1.517929407
+    raise ValueError(
+        'PAIR initialization supports exact GELU, ReLU, and SiLU activations only.'
+    )
+
+
+def build_pair_mlp_weights(
+    hidden_size: int,
+    ffn_hidden_size: int,
+    activation_func,
+    input_second_moment: float,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the coupled PAIR up and down projection weights in float64 on CPU."""
+    if hidden_size < 2 or hidden_size % 2 != 0:
+        raise ValueError('PAIR initialization requires an even hidden size of at least two.')
+    if ffn_hidden_size % 2 != 0:
+        raise ValueError('PAIR initialization requires an even FFN hidden size.')
+    if input_second_moment <= 0.0:
+        raise ValueError('PAIR input second moment must be positive.')
+
+    d = hidden_size
+    m = ffn_hidden_size // 2
+    if m < d:
+        raise ValueError('PAIR initialization requires half the FFN hidden size to be at least d.')
+
+    gamma = _pair_activation_gamma(activation_func)
+    beta = 0.25 * math.log(gamma)
+    positions = torch.linspace(-1.0, 1.0, d, dtype=torch.float64)
+    mean_squared_scale = 2.0 * m / (d * input_second_moment)
+    sigma_center = math.sqrt(mean_squared_scale) / torch.exp(2.0 * beta * positions).mean().sqrt()
+    singular_values = sigma_center * torch.exp(beta * positions)
+
+    layer_seed = int(seed)
+    generator_v = torch.Generator(device='cpu')
+    generator_v.manual_seed(layer_seed)
+    generator_u = torch.Generator(device='cpu')
+    generator_u.manual_seed(layer_seed + 1)
+
+    v_factors = _randomized_dct_factors(d, generator_v)
+    u = _antipodal_parseval_frame(m, d, generator_u)
+
+    ga = _apply_randomized_dct(u * singular_values, v_factors)
+    gb_transpose_input = u / singular_values
+    gb_transpose_input = _right_multiply_reverse_pair_j0_transpose(gb_transpose_input)
+    gb = (2.0 * _apply_randomized_dct(gb_transpose_input, v_factors)).transpose(0, 1)
+
+    pair_scale = 1.0 / math.sqrt(2.0)
+    up_weight = torch.cat((ga, ga), dim=0) * pair_scale
+    down_weight = torch.cat((gb, -gb), dim=1) * pair_scale
+    return up_weight.contiguous(), down_weight.contiguous()
 
 
 # pylint: disable=missing-class-docstring
@@ -147,6 +310,48 @@ class MLP(MegatronModule):
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
         )
+
+    def set_layer_number(self, layer_number: int):
+        """Record the global layer number and apply the configured coupled initialization."""
+        self.layer_number = layer_number
+        if not self.config.pair_init:
+            return
+        if self.config.gated_linear_unit:
+            raise ValueError('PAIR initialization requires a non-gated dense MLP.')
+
+        up_weight = getattr(self.linear_fc1, 'weight', None)
+        down_weight = getattr(self.linear_fc2, 'weight', None)
+        if up_weight is None or down_weight is None:
+            raise ValueError('PAIR initialization requires explicit fc1 and fc2 weight tensors.')
+        if up_weight.is_meta or down_weight.is_meta:
+            raise ValueError('PAIR initialization requires materialized fc1 and fc2 weights.')
+        if not up_weight.is_floating_point() or not down_weight.is_floating_point():
+            raise ValueError('PAIR initialization requires floating-point fc1 and fc2 weights.')
+
+        ffn_hidden_size, hidden_size = up_weight.shape
+        if tuple(down_weight.shape) != (hidden_size, ffn_hidden_size):
+            raise ValueError(
+                'PAIR initialization requires fc1 [2m, d] and fc2 [d, 2m] with matching dimensions.'
+            )
+
+        pair_seed = self.config.pair_init_seed + 1_000_003 * layer_number
+        pair_up, pair_down = build_pair_mlp_weights(
+            hidden_size=hidden_size,
+            ffn_hidden_size=ffn_hidden_size,
+            activation_func=self.config.activation_func,
+            input_second_moment=self.config.pair_init_input_second_moment,
+            seed=pair_seed,
+        )
+
+        with torch.no_grad():
+            up_weight.copy_(pair_up.to(device=up_weight.device, dtype=up_weight.dtype))
+            down_weight.copy_(pair_down.to(device=down_weight.device, dtype=down_weight.dtype))
+            up_bias = getattr(self.linear_fc1, 'bias', None)
+            down_bias = getattr(self.linear_fc2, 'bias', None)
+            if up_bias is not None:
+                up_bias.zero_()
+            if down_bias is not None:
+                down_bias.zero_()
 
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
