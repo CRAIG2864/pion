@@ -2328,7 +2328,6 @@ def training_log(
         )
     # 将每个 step 的 grad norm 写入 checkpoint 目录下的 CSV
     if args.save is not None and grad_norm is not None and is_last_rank():
-            import csv
             save_dir = args.save
             os.makedirs(save_dir, exist_ok=True)
             csv_path = os.path.join(save_dir, 'grad_norm.csv')
