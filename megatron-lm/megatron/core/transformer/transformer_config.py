@@ -306,6 +306,12 @@ class TransformerConfig(ModelParallelConfig):
     pair_init: bool = False
     """Apply the coupled PAIR initialization to dense GELU or fused SwiGLU MLP weights."""
 
+    om_pair_init: bool = False
+    """Apply GELU OM-PAIR using the independent Standard shadow spectra of fc1 and fc2."""
+
+    om_skew_pair_init: bool = False
+    """Apply GELU OM-Skew PAIR using a shared Standard spectrum and skew bridge."""
+
     pair_init_input_second_moment: float = 1.0
     """Mean squared coordinate value at the input of a PAIR-initialized MLP."""
 

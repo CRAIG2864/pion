@@ -399,6 +399,263 @@ def _pair_swiglu_initialization_diagnostics(
     }
 
 
+def _om_pair_spectrum_metrics(
+    prefix: str, singular_values: torch.Tensor, matrix_shape: tuple[int, int]
+) -> dict[str, float]:
+    """Summarize the nonzero singular spectrum used by one OM-PAIR projection."""
+    machine_epsilon = torch.finfo(singular_values.dtype).eps
+    sigma_max = singular_values.max()
+    sigma_min = singular_values.min()
+    rank_tolerance = max(matrix_shape) * machine_epsilon * sigma_max
+    squared = singular_values.square()
+    probabilities = squared / squared.sum()
+    effective_rank = torch.exp(
+        -(probabilities * probabilities.clamp_min(machine_epsilon).log()).sum()
+    )
+    quantiles = torch.quantile(
+        singular_values,
+        torch.tensor((0.25, 0.5, 0.75), dtype=singular_values.dtype),
+    )
+    condition_number = sigma_max / sigma_min
+    return {
+        f'{prefix}_rank': float((singular_values > rank_tolerance).sum()),
+        f'{prefix}_sigma_min': float(sigma_min),
+        f'{prefix}_sigma_q25': float(quantiles[0]),
+        f'{prefix}_sigma_median': float(quantiles[1]),
+        f'{prefix}_sigma_q75': float(quantiles[2]),
+        f'{prefix}_sigma_max': float(sigma_max),
+        f'{prefix}_condition_number': float(condition_number),
+        f'{prefix}_gram_condition_number': float(condition_number.square()),
+        f'{prefix}_effective_rank': float(effective_rank),
+    }
+
+
+@torch.no_grad()
+def _om_pair_initialization_diagnostics(
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    target_up_singular_values: torch.Tensor,
+    target_down_singular_values: torch.Tensor,
+    activation_func,
+    input_second_moment: float,
+    seed: int,
+    calibration_size: int,
+) -> dict[str, float]:
+    """Measure OM-PAIR zero output and per-matrix Standard-spectrum matching."""
+    ffn_hidden_size, hidden_size = up_weight.shape
+    half_ffn_size = ffn_hidden_size // 2
+    pair_scale_inverse = math.sqrt(2.0)
+    ga = up_weight[:half_ffn_size] * pair_scale_inverse
+    gb = down_weight[:, :half_ffn_size] * pair_scale_inverse
+
+    up_singular_values = torch.linalg.svdvals(ga)
+    down_singular_values = torch.linalg.svdvals(gb)
+    up_spectrum_match_error = torch.linalg.vector_norm(
+        up_singular_values - target_up_singular_values
+    ) / torch.linalg.vector_norm(target_up_singular_values)
+    down_spectrum_match_error = torch.linalg.vector_norm(
+        down_singular_values - target_down_singular_values
+    ) / torch.linalg.vector_norm(target_down_singular_values)
+
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(seed) + 4)
+    inputs = torch.randn(
+        hidden_size, calibration_size, generator=generator, dtype=torch.float64
+    ) * math.sqrt(input_second_moment)
+    directions = torch.randn(
+        hidden_size, calibration_size, generator=generator, dtype=torch.float64
+    )
+    input_norm = torch.linalg.vector_norm(inputs)
+    direction_norm = torch.linalg.vector_norm(directions)
+    preactivations = up_weight @ inputs
+    zero_output = down_weight @ activation_func(preactivations)
+    directional_branch_jacobian = down_weight @ (
+        _pair_activation_derivative(preactivations, activation_func)
+        * (up_weight @ directions)
+    )
+    bridge_singular_values = torch.linalg.svdvals(0.5 * (gb @ ga))
+
+    metrics = {
+        'up_spectrum_match_error': float(up_spectrum_match_error),
+        'down_spectrum_match_error': float(down_spectrum_match_error),
+        'zero_output_ratio': float(torch.linalg.vector_norm(zero_output) / input_norm),
+        'residual_jacobian_directional_error': float(
+            torch.linalg.vector_norm(directional_branch_jacobian) / direction_norm
+        ),
+        'calibration_input_second_moment': float(inputs.square().mean()),
+    }
+    metrics.update(
+        _om_pair_spectrum_metrics('up', up_singular_values, tuple(up_weight.shape))
+    )
+    metrics.update(
+        _om_pair_spectrum_metrics('down', down_singular_values, tuple(down_weight.shape))
+    )
+    metrics.update(
+        _om_pair_spectrum_metrics(
+            'bridge', bridge_singular_values, (hidden_size, hidden_size)
+        )
+    )
+    return metrics
+
+
+@torch.no_grad()
+def build_orbit_matched_pair_mlp_weights(
+    standard_up_weight: torch.Tensor,
+    standard_down_weight: torch.Tensor,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build GELU OM-PAIR weights with each Standard shadow spectrum preserved."""
+    standard_up = standard_up_weight.detach().to(device='cpu', dtype=torch.float64)
+    standard_down = standard_down_weight.detach().to(device='cpu', dtype=torch.float64)
+    ffn_hidden_size, hidden_size = standard_up.shape
+    half_ffn_size = ffn_hidden_size // 2
+
+    target_up_singular_values = torch.linalg.svdvals(standard_up)
+    target_down_singular_values = torch.linalg.svdvals(standard_down)
+
+    layer_seed = int(seed)
+    generator_up_left = torch.Generator(device='cpu')
+    generator_up_left.manual_seed(layer_seed)
+    generator_up_right = torch.Generator(device='cpu')
+    generator_up_right.manual_seed(layer_seed + 1)
+    generator_down_left = torch.Generator(device='cpu')
+    generator_down_left.manual_seed(layer_seed + 2)
+    generator_down_right = torch.Generator(device='cpu')
+    generator_down_right.manual_seed(layer_seed + 3)
+
+    up_left_frame = _parseval_frame(half_ffn_size, hidden_size, generator_up_left)
+    up_right_factors = _randomized_dct_factors(hidden_size, generator_up_right)
+    ga = _apply_randomized_dct(
+        up_left_frame * target_up_singular_values, up_right_factors
+    )
+
+    down_right_frame = _parseval_frame(
+        half_ffn_size, hidden_size, generator_down_right
+    )
+    down_left_factors = _randomized_dct_factors(hidden_size, generator_down_left)
+    gb = _apply_randomized_dct(
+        down_right_frame * target_down_singular_values, down_left_factors
+    ).transpose(0, 1)
+
+    pair_scale = 1.0 / math.sqrt(2.0)
+    up_weight = torch.cat((ga, ga), dim=0) * pair_scale
+    down_weight = torch.cat((gb, -gb), dim=1) * pair_scale
+    return (
+        up_weight.contiguous(),
+        down_weight.contiguous(),
+        target_up_singular_values,
+        target_down_singular_values,
+    )
+
+
+@torch.no_grad()
+def _om_skew_pair_initialization_diagnostics(
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    target_up_singular_values: torch.Tensor,
+    target_down_singular_values: torch.Tensor,
+    down_spectrum_scale: float,
+    activation_func,
+    input_second_moment: float,
+    seed: int,
+    calibration_size: int,
+) -> dict[str, float]:
+    """Measure OM-Skew spectrum matching, metric alignment, and skew bridge."""
+    metrics = _om_pair_initialization_diagnostics(
+        up_weight=up_weight,
+        down_weight=down_weight,
+        target_up_singular_values=target_up_singular_values,
+        target_down_singular_values=target_down_singular_values,
+        activation_func=activation_func,
+        input_second_moment=input_second_moment,
+        seed=seed,
+        calibration_size=calibration_size,
+    )
+
+    half_ffn_size = up_weight.shape[0] // 2
+    pair_scale_inverse = math.sqrt(2.0)
+    ga = up_weight[:half_ffn_size] * pair_scale_inverse
+    gb = down_weight[:, :half_ffn_size] * pair_scale_inverse
+    up_metric = ga.transpose(0, 1) @ ga
+    down_metric = gb @ gb.transpose(0, 1)
+    aligned_down_metric = float(down_spectrum_scale) ** 2 * up_metric
+    bridge = 0.5 * (gb @ ga)
+    down_singular_values = torch.linalg.svdvals(gb)
+    shared_down_singular_values = (
+        float(down_spectrum_scale) * torch.linalg.svdvals(ga)
+    )
+
+    metrics.update(
+        {
+            'down_spectrum_scale': float(down_spectrum_scale),
+            'down_shared_spectrum_match_error': float(
+                torch.linalg.vector_norm(
+                    down_singular_values - shared_down_singular_values
+                )
+                / torch.linalg.vector_norm(shared_down_singular_values)
+            ),
+            'metric_alignment_error': float(
+                torch.linalg.vector_norm(down_metric - aligned_down_metric)
+                / torch.linalg.vector_norm(aligned_down_metric)
+            ),
+            'bridge_skew_error': float(
+                torch.linalg.vector_norm(bridge + bridge.transpose(0, 1))
+                / torch.linalg.vector_norm(bridge)
+            ),
+        }
+    )
+    return metrics
+
+
+@torch.no_grad()
+def build_orbit_matched_skew_pair_mlp_weights(
+    standard_up_weight: torch.Tensor,
+    standard_down_weight: torch.Tensor,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Build GELU OM-Skew PAIR with a shared Standard spectrum and skew bridge."""
+    standard_up = standard_up_weight.detach().to(device='cpu', dtype=torch.float64)
+    standard_down = standard_down_weight.detach().to(device='cpu', dtype=torch.float64)
+    ffn_hidden_size, hidden_size = standard_up.shape
+    half_ffn_size = ffn_hidden_size // 2
+
+    if hidden_size % 2 != 0:
+        raise ValueError('OM-Skew PAIR requires an even hidden size.')
+
+    target_up_singular_values = torch.linalg.svdvals(standard_up)
+    target_down_singular_values = torch.linalg.svdvals(standard_down)
+    down_spectrum_scale = float(
+        torch.linalg.vector_norm(target_down_singular_values)
+        / torch.linalg.vector_norm(target_up_singular_values)
+    )
+
+    generator_u = torch.Generator(device='cpu')
+    generator_u.manual_seed(int(seed))
+    generator_v = torch.Generator(device='cpu')
+    generator_v.manual_seed(int(seed) + 1)
+
+    u = _antipodal_parseval_frame(half_ffn_size, hidden_size, generator_u)
+    v_factors = _randomized_dct_factors(hidden_size, generator_v)
+    ga = _apply_randomized_dct(u * target_up_singular_values, v_factors)
+
+    gb_transpose_input = _right_multiply_reverse_pair_j0_transpose(u)
+    gb_transpose_input = gb_transpose_input * target_up_singular_values
+    gb = down_spectrum_scale * _apply_randomized_dct(
+        gb_transpose_input, v_factors
+    ).transpose(0, 1)
+
+    pair_scale = 1.0 / math.sqrt(2.0)
+    up_weight = torch.cat((ga, ga), dim=0) * pair_scale
+    down_weight = torch.cat((gb, -gb), dim=1) * pair_scale
+    return (
+        up_weight.contiguous(),
+        down_weight.contiguous(),
+        target_up_singular_values,
+        target_down_singular_values,
+        down_spectrum_scale,
+    )
+
+
 def build_pair_mlp_weights(
     hidden_size: int,
     ffn_hidden_size: int,
@@ -617,7 +874,11 @@ class MLP(MegatronModule):
     def set_layer_number(self, layer_number: int):
         """Record the global layer number and apply the configured coupled initialization."""
         self.layer_number = layer_number
-        if not self.config.pair_init:
+        if not (
+            self.config.pair_init
+            or self.config.om_pair_init
+            or self.config.om_skew_pair_init
+        ):
             return
 
         fc1_weight = getattr(self.linear_fc1, 'weight', None)
@@ -639,7 +900,53 @@ class MLP(MegatronModule):
             )
 
         pair_seed = self.config.pair_init_seed + 1_000_003 * layer_number
-        if self.config.gated_linear_unit:
+        if self.config.om_skew_pair_init:
+            (
+                pair_fc1,
+                pair_down,
+                target_up_singular_values,
+                target_down_singular_values,
+                down_spectrum_scale,
+            ) = build_orbit_matched_skew_pair_mlp_weights(
+                standard_up_weight=fc1_weight,
+                standard_down_weight=down_weight,
+                seed=pair_seed,
+            )
+            if self.config.pair_diagnostics:
+                self._pair_initial_metrics = _om_skew_pair_initialization_diagnostics(
+                    up_weight=pair_fc1,
+                    down_weight=pair_down,
+                    target_up_singular_values=target_up_singular_values,
+                    target_down_singular_values=target_down_singular_values,
+                    down_spectrum_scale=down_spectrum_scale,
+                    activation_func=self.config.activation_func,
+                    input_second_moment=self.config.pair_init_input_second_moment,
+                    seed=pair_seed,
+                    calibration_size=self.config.pair_diagnostics_calibration_size,
+                )
+        elif self.config.om_pair_init:
+            (
+                pair_fc1,
+                pair_down,
+                target_up_singular_values,
+                target_down_singular_values,
+            ) = build_orbit_matched_pair_mlp_weights(
+                standard_up_weight=fc1_weight,
+                standard_down_weight=down_weight,
+                seed=pair_seed,
+            )
+            if self.config.pair_diagnostics:
+                self._pair_initial_metrics = _om_pair_initialization_diagnostics(
+                    up_weight=pair_fc1,
+                    down_weight=pair_down,
+                    target_up_singular_values=target_up_singular_values,
+                    target_down_singular_values=target_down_singular_values,
+                    activation_func=self.config.activation_func,
+                    input_second_moment=self.config.pair_init_input_second_moment,
+                    seed=pair_seed,
+                    calibration_size=self.config.pair_diagnostics_calibration_size,
+                )
+        elif self.config.gated_linear_unit:
             pair_fc1, pair_down, paired_dimension, defect_dimension = (
                 build_pair_swiglu_mlp_weights(
                     hidden_size=hidden_size,
@@ -688,7 +995,11 @@ class MLP(MegatronModule):
 
     def set_pair_diagnostics_collection(self, enabled: bool) -> None:
         """Enable one bounded collection window for PAIR activation statistics."""
-        if enabled and not self.config.pair_init:
+        if enabled and not (
+            self.config.pair_init
+            or self.config.om_pair_init
+            or self.config.om_skew_pair_init
+        ):
             raise ValueError('PAIR diagnostics require PAIR-initialized MLP layers.')
         self._pair_diagnostics_collect = enabled
         self._pair_diagnostics_accumulator = None

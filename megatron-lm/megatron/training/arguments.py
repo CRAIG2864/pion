@@ -1109,25 +1109,50 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
-    if args.pair_init:
+    pair_init_options = (
+        ('--pair-init', args.pair_init),
+        ('--om-pair-init', args.om_pair_init),
+        ('--om-skew-pair-init', args.om_skew_pair_init),
+    )
+    selected_pair_options = [name for name, enabled in pair_init_options if enabled]
+    if len(selected_pair_options) > 1:
+        raise ValueError(
+            f'{", ".join(selected_pair_options)} select different initializations.'
+        )
+
+    if selected_pair_options:
+        pair_option = selected_pair_options[0]
+        orbit_matched_init = args.om_pair_init or args.om_skew_pair_init
         if args.use_legacy_models:
-            raise ValueError('--pair-init requires Megatron Core models.')
+            raise ValueError(f'{pair_option} requires Megatron Core models.')
         if args.tensor_model_parallel_size != 1:
-            raise ValueError('--pair-init requires --tensor-model-parallel-size 1.')
+            raise ValueError(f'{pair_option} requires --tensor-model-parallel-size 1.')
         if args.num_experts is not None:
-            raise ValueError('--pair-init supports dense MLP layers only.')
+            raise ValueError(f'{pair_option} supports dense MLP layers only.')
         if args.squared_relu or args.quick_geglu:
-            raise ValueError('--pair-init supports the standard GELU and SwiGLU activations.')
+            raise ValueError(
+                f'{pair_option} supports the standard GELU activation'
+                + (' and SwiGLU.' if args.pair_init else '.')
+            )
+        if orbit_matched_init and args.swiglu:
+            raise ValueError(f'{pair_option} supports the two-matrix GELU MLP.')
         if args.init_spectral_norm_scale is not None:
-            raise ValueError('--pair-init cannot be combined with --init-spectral-norm-scale.')
+            raise ValueError(
+                f'{pair_option} cannot be combined with --init-spectral-norm-scale.'
+            )
         if args.init_model_with_meta_device:
-            raise ValueError('--pair-init requires materialized parameters during model construction.')
+            raise ValueError(
+                f'{pair_option} requires materialized parameters during model construction.'
+            )
         if args.pair_init_input_second_moment <= 0.0:
             raise ValueError('--pair-init-input-second-moment must be positive.')
 
     if args.pair_diagnostics:
-        if not args.pair_init:
-            raise ValueError('--pair-diagnostics requires --pair-init.')
+        if not selected_pair_options:
+            raise ValueError(
+                '--pair-diagnostics requires --pair-init, --om-pair-init, '
+                'or --om-skew-pair-init.'
+            )
         if args.pipeline_model_parallel_size != 1:
             raise ValueError('--pair-diagnostics requires --pipeline-model-parallel-size 1.')
         if args.recompute_granularity is not None:
@@ -2725,6 +2750,14 @@ def _add_initialization_args(parser):
                        help='After the standard linear-layer initialization, jointly overwrite '
                        'the dense GELU projections or fused SwiGLU gate, up, and down weights '
                        'with PAIR initialization.')
+    group.add_argument('--om-pair-init', action='store_true',
+                       help='After Standard initialization, overwrite the dense GELU projections '
+                       'with zero-output OM-PAIR weights that independently preserve the actual '
+                       'fc1 and fc2 shadow singular spectra.')
+    group.add_argument('--om-skew-pair-init', action='store_true',
+                       help='After Standard initialization, overwrite the dense GELU projections '
+                       'with zero-output OM-Skew PAIR weights using the fc1 shadow spectrum, the '
+                       'fc2-to-fc1 spectral energy ratio, and a skew reverse-pair bridge.')
     group.add_argument('--pair-init-input-second-moment', type=float, default=1.0,
                        help='Mean squared coordinate value at the input of each PAIR-initialized MLP.')
     group.add_argument('--pair-diagnostics', action='store_true',
